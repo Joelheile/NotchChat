@@ -53,3 +53,7 @@ build/
 *.xcarchive
 *.dSYM
 
+
+# WhatsApp sidecar compiled binary (build locally via whatsapp-sidecar/build.sh)
+whatsapp-sidecar/whatsapp-sidecar
+boringNotch/private/whatsapp-sidecar
