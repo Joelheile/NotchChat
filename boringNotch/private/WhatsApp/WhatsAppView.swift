@@ -245,6 +245,11 @@ struct WhatsAppView: View {
                       let newest = displayedMessages.last else { return }
                 withAnimation { proxy.scrollTo(newest.id, anchor: .center) }
             }
+            // Reopening the notch always lands on the newest message.
+            .onAppear {
+                guard let newest = displayedMessages.last else { return }
+                proxy.scrollTo(newest.id, anchor: .center)
+            }
         }
     }
 
