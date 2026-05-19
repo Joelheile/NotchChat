@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -45,8 +47,8 @@ type Message struct {
 	Type             string `json:"type"` // text | audio | image | other
 	MediaID          string `json:"mediaID,omitempty"`
 	MediaContentType string `json:"mediaContentType,omitempty"`
-	Duration         int    `json:"duration,omitempty"`
-	PushName         string `json:"pushName,omitempty"`
+	Duration         int    `json:"duration"`
+	PushName         string `json:"pushName"`
 }
 
 // Event is one Server-Sent-Events frame.
@@ -57,8 +59,10 @@ type Event struct {
 
 type App struct {
 	client    *whatsmeow.Client
+	container *sqlstore.Container
 	dataDir   string
 	mediaDir  string
+	avatarDir string
 	token     string
 	port      int
 	clientLog waLog.Logger
@@ -67,7 +71,12 @@ type App struct {
 	mu       sync.Mutex
 	subs     map[chan []byte]bool
 	messages []Message
+	lastQR   string          // most recent QR code, replayed to new SSE clients
+	contacts map[string]bool // configured chat JIDs; scopes history import
 }
+
+// historyWindow bounds how far back history sync is imported.
+const historyWindow = 30 * 24 * time.Hour
 
 const maxStoredMessages = 500
 
@@ -85,14 +94,18 @@ func main() {
 	app := &App{
 		dataDir:   *dataDir,
 		mediaDir:  filepath.Join(*dataDir, "media"),
+		avatarDir: filepath.Join(*dataDir, "avatars"),
 		token:     *token,
 		port:      *port,
 		clientLog: waLog.Stdout("Client", "WARN", true),
 		dbLog:     waLog.Stdout("DB", "WARN", true),
 		subs:      map[chan []byte]bool{},
+		contacts:  map[string]bool{},
 	}
-	if err := os.MkdirAll(app.mediaDir, 0o700); err != nil {
-		log.Fatalf("cannot create media dir: %v", err)
+	for _, dir := range []string{app.mediaDir, app.avatarDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			log.Fatalf("cannot create dir %s: %v", dir, err)
+		}
 	}
 	if app.token == "" {
 		log.Print("WARNING: no --token set, request authentication is DISABLED")
@@ -107,7 +120,10 @@ func main() {
 	mux.HandleFunc("/events", app.handleEvents)
 	mux.HandleFunc("/status", app.handleStatus)
 	mux.HandleFunc("/send", app.handleSend)
+	mux.HandleFunc("/sendImage", app.handleSendImage)
 	mux.HandleFunc("/media", app.handleMedia)
+	mux.HandleFunc("/avatar", app.handleAvatar)
+	mux.HandleFunc("/contacts", app.handleContacts)
 	mux.HandleFunc("/logout", app.handleLogout)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
@@ -178,7 +194,15 @@ func (a *App) startWhatsApp() error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	device, err := container.GetFirstDevice(ctx)
+	a.container = container
+	return a.connectClient(ctx)
+}
+
+// connectClient builds a fresh client from the stored device and either
+// connects an existing session or starts a QR login. Safe to call again after
+// a logout to re-arm a new QR.
+func (a *App) connectClient(ctx context.Context) error {
+	device, err := a.container.GetFirstDevice(ctx)
 	if err != nil {
 		return fmt.Errorf("get device: %w", err)
 	}
@@ -196,14 +220,31 @@ func (a *App) startWhatsApp() error {
 		go func() {
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					a.mu.Lock()
+					a.lastQR = evt.Code
+					a.mu.Unlock()
 					a.broadcast("qr", evt.Code)
 				} else {
+					a.mu.Lock()
+					a.lastQR = ""
+					a.mu.Unlock()
 					a.broadcast("qrevent", evt.Event)
+					// whatsmeow closes the QR channel after a timeout; without
+					// re-arming, the login screen is stuck on a dead code.
+					if evt.Event == "timeout" {
+						a.client.Disconnect()
+						if err := a.connectClient(context.Background()); err != nil {
+							log.Printf("qr re-arm failed: %v", err)
+						}
+					}
 				}
 			}
 		}()
 		return nil
 	}
+	a.mu.Lock()
+	a.lastQR = ""
+	a.mu.Unlock()
 	return a.client.Connect()
 }
 
@@ -219,6 +260,45 @@ func (a *App) handleEvent(rawEvt interface{}) {
 		a.broadcast("status", a.statusPayload())
 	case *events.LoggedOut:
 		a.broadcast("loggedout", nil)
+	case *events.HistorySync:
+		a.importHistory(evt)
+	}
+}
+
+// importHistory ingests the message history WhatsApp pushes automatically after
+// a device is linked. This is the standard multi-device sync protocol, so it
+// carries no risk of the account being flagged or blocked.
+func (a *App) importHistory(evt *events.HistorySync) {
+	if evt.Data == nil {
+		return
+	}
+	a.mu.Lock()
+	wanted := a.contacts
+	a.mu.Unlock()
+	cutoff := time.Now().Add(-historyWindow).Unix()
+	count := 0
+	for _, conv := range evt.Data.GetConversations() {
+		chatJID := conv.GetID()
+		if j, err := types.ParseJID(chatJID); err == nil {
+			chatJID = a.canonicalJID(j)
+		}
+		// Only import history for chats the notch app is configured to show.
+		if len(wanted) > 0 && !wanted[chatJID] {
+			continue
+		}
+		for _, hsm := range conv.GetMessages() {
+			wmi := hsm.GetMessage()
+			if int64(wmi.GetMessageTimestamp()) < cutoff {
+				continue
+			}
+			if m := a.convertWebMessage(chatJID, wmi); m != nil {
+				a.addMessage(*m)
+				count++
+			}
+		}
+	}
+	if count > 0 {
+		log.Printf("imported %d history messages", count)
 	}
 }
 
@@ -226,16 +306,63 @@ func (a *App) handleEvent(rawEvt interface{}) {
 // Unsupported message kinds return nil.
 func (a *App) convertMessage(evt *events.Message) *Message {
 	info := evt.Info
+	// For LID-addressed DMs the Chat/Sender JIDs hide the phone number; the
+	// Alt fields carry the phone-number form directly, which is what the notch
+	// app keys chats by. Groups keep their @g.us JID.
+	chat := info.Chat
+	if !info.IsGroup && info.Chat.Server == types.HiddenUserServer {
+		if info.IsFromMe && !info.RecipientAlt.IsEmpty() {
+			chat = info.RecipientAlt
+		} else if !info.IsFromMe && !info.SenderAlt.IsEmpty() {
+			chat = info.SenderAlt
+		}
+	}
 	m := &Message{
 		ID:        info.ID,
-		ChatJID:   info.Chat.String(),
-		SenderJID: info.Sender.String(),
+		ChatJID:   a.canonicalJID(chat),
+		SenderJID: a.canonicalJID(info.Sender),
 		FromMe:    info.IsFromMe,
 		Timestamp: info.Timestamp.Unix(),
 		PushName:  info.PushName,
 		Type:      "text",
 	}
-	wm := evt.Message
+	a.applyContent(m, evt.Message, true)
+	if m.Type == "text" && m.Text == "" {
+		return nil // sticker, reaction, protocol message, etc.
+	}
+	return m
+}
+
+// convertWebMessage adapts a history-sync message into the wire format.
+func (a *App) convertWebMessage(chatJID string, wmi *waWeb.WebMessageInfo) *Message {
+	key := wmi.GetKey()
+	if key == nil || key.GetID() == "" {
+		return nil
+	}
+	m := &Message{
+		ID:        key.GetID(),
+		ChatJID:   chatJID,
+		SenderJID: key.GetParticipant(),
+		FromMe:    key.GetFromMe(),
+		Timestamp: int64(wmi.GetMessageTimestamp()),
+		PushName:  wmi.GetPushName(),
+		Type:      "text",
+	}
+	// History is bounded to the last 30 days, so media is recent enough to
+	// still download. Expired downloads fail quietly and degrade to a stub.
+	a.applyContent(m, wmi.GetMessage(), true)
+	if m.Type == "text" && m.Text == "" {
+		return nil
+	}
+	return m
+}
+
+// applyContent fills type/text/media on m from a decrypted message body. When
+// download is true, attached media is fetched and cached locally.
+func (a *App) applyContent(m *Message, wm *waE2E.Message, download bool) {
+	if wm == nil {
+		return
+	}
 	if c := wm.GetConversation(); c != "" {
 		m.Text = c
 	} else if ext := wm.GetExtendedTextMessage(); ext != nil {
@@ -244,20 +371,24 @@ func (a *App) convertMessage(evt *events.Message) *Message {
 	if audio := wm.GetAudioMessage(); audio != nil {
 		m.Type = "audio"
 		m.Duration = int(audio.GetSeconds())
-		if path, ct := a.downloadAudio(info.ID, audio); path != "" {
-			m.MediaID = info.ID
-			m.MediaContentType = ct
+		if download {
+			if path, ct := a.downloadAudio(m.ID, audio); path != "" {
+				m.MediaID = m.ID
+				m.MediaContentType = ct
+			}
 		}
 	} else if img := wm.GetImageMessage(); img != nil {
 		m.Type = "image"
 		if m.Text == "" {
 			m.Text = img.GetCaption()
 		}
+		if download {
+			if path, ct := a.downloadImage(m.ID, img); path != "" {
+				m.MediaID = m.ID
+				m.MediaContentType = ct
+			}
+		}
 	}
-	if m.Type == "text" && m.Text == "" {
-		return nil // sticker, reaction, protocol message, etc.
-	}
-	return m
 }
 
 // downloadAudio fetches a voice note and caches it to disk. WhatsApp voice
@@ -283,6 +414,50 @@ func (a *App) downloadAudio(id string, audio *waE2E.AudioMessage) (string, strin
 		}
 	}
 	return oggPath, "audio/ogg"
+}
+
+// downloadImage fetches a photo and caches it to disk so the UI can display it.
+func (a *App) downloadImage(id string, img *waE2E.ImageMessage) (string, string) {
+	data, err := a.client.Download(context.Background(), img)
+	if err != nil {
+		log.Printf("image download failed: %v", err)
+		return "", ""
+	}
+	ct, ext := imageExt(img.GetMimetype())
+	path := filepath.Join(a.mediaDir, id+ext)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		log.Printf("image write failed: %v", err)
+		return "", ""
+	}
+	return path, ct
+}
+
+// imageExt normalises a MIME type to a (contentType, fileExtension) pair,
+// defaulting unknown types to JPEG.
+func imageExt(mime string) (string, string) {
+	switch mime {
+	case "image/png":
+		return "image/png", ".png"
+	case "image/webp":
+		return "image/webp", ".webp"
+	case "image/gif":
+		return "image/gif", ".gif"
+	default:
+		return "image/jpeg", ".jpg"
+	}
+}
+
+// canonicalJID normalizes a JID to its phone-number form. WhatsApp's LID
+// addressing hides phone numbers behind "@lid" JIDs; the notch app keys chats
+// by the phone-number JID, so LID JIDs are resolved back through the device
+// store's LID mapping. Non-LID JIDs are returned unchanged.
+func (a *App) canonicalJID(jid types.JID) string {
+	if jid.Server == types.HiddenUserServer && a.client != nil {
+		if pn, err := a.client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pn.IsEmpty() {
+			return pn.String()
+		}
+	}
+	return jid.String()
 }
 
 func (a *App) addMessage(m Message) {
@@ -338,10 +513,12 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := make(chan []byte, 64)
+	// Generous buffer so a history-sync burst is not dropped for a live client.
+	ch := make(chan []byte, 4096)
 	a.mu.Lock()
 	a.subs[ch] = true
 	snapshot := append([]Message(nil), a.messages...)
+	lastQR := a.lastQR
 	a.mu.Unlock()
 	defer func() {
 		a.mu.Lock()
@@ -364,10 +541,16 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !writeFrame("status", a.statusPayload()) {
 		return
 	}
-	for _, m := range snapshot {
-		if !writeFrame("message", m) {
+	// Replay the pending QR so a client that connects mid-login still sees it.
+	if lastQR != "" {
+		if !writeFrame("qr", lastQR) {
 			return
 		}
+	}
+	// Send stored history as one batch so the client renders it in a single
+	// pass and can anchor the view to the newest message without scroll jank.
+	if !writeFrame("messages", snapshot) {
+		return
 	}
 
 	keepAlive := time.NewTicker(15 * time.Second)
@@ -430,6 +613,10 @@ func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid recipient: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if a.client == nil {
+		http.Error(w, "not connected", http.StatusServiceUnavailable)
+		return
+	}
 	resp, err := a.client.SendMessage(context.Background(), jid, &waE2E.Message{
 		Conversation: proto.String(body.Text),
 	})
@@ -448,6 +635,82 @@ func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"id": resp.ID})
 }
 
+// handleSendImage accepts a multipart upload (form field "image", plus "to"
+// and optional "caption"), uploads the photo to WhatsApp, and sends it.
+func (a *App) handleSendImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	jid, err := types.ParseJID(r.FormValue("to"))
+	if err != nil {
+		http.Error(w, "invalid recipient: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if a.client == nil {
+		http.Error(w, "not connected", http.StatusServiceUnavailable)
+		return
+	}
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "missing image: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	mime := header.Header.Get("Content-Type")
+	if mime == "" {
+		mime = http.DetectContentType(data)
+	}
+	ct, ext := imageExt(mime)
+
+	uploaded, err := a.client.Upload(context.Background(), data, whatsmeow.MediaImage)
+	if err != nil {
+		http.Error(w, "upload failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	caption := r.FormValue("caption")
+	resp, err := a.client.SendMessage(context.Background(), jid, &waE2E.Message{
+		ImageMessage: &waE2E.ImageMessage{
+			Caption:       proto.String(caption),
+			Mimetype:      proto.String(ct),
+			URL:           proto.String(uploaded.URL),
+			DirectPath:    proto.String(uploaded.DirectPath),
+			MediaKey:      uploaded.MediaKey,
+			FileEncSHA256: uploaded.FileEncSHA256,
+			FileSHA256:    uploaded.FileSHA256,
+			FileLength:    proto.Uint64(uint64(len(data))),
+		},
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Cache the original so the bubble can render without a round trip.
+	if err := os.WriteFile(filepath.Join(a.mediaDir, resp.ID+ext), data, 0o600); err != nil {
+		log.Printf("sent image cache failed: %v", err)
+	}
+	a.addMessage(Message{
+		ID:               resp.ID,
+		ChatJID:          jid.String(),
+		FromMe:           true,
+		Timestamp:        resp.Timestamp.Unix(),
+		Text:             caption,
+		Type:             "image",
+		MediaID:          resp.ID,
+		MediaContentType: ct,
+	})
+	writeJSON(w, map[string]string{"id": resp.ID})
+}
+
 func (a *App) handleMedia(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
@@ -462,6 +725,10 @@ func (a *App) handleMedia(w http.ResponseWriter, r *http.Request) {
 	for _, ext := range []struct{ suffix, ctype string }{
 		{".m4a", "audio/mp4"},
 		{".ogg", "audio/ogg"},
+		{".jpg", "image/jpeg"},
+		{".png", "image/png"},
+		{".webp", "image/webp"},
+		{".gif", "image/gif"},
 	} {
 		path := filepath.Join(a.mediaDir, id+ext.suffix)
 		if _, err := os.Stat(path); err == nil {
@@ -473,14 +740,100 @@ func (a *App) handleMedia(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "not found", http.StatusNotFound)
 }
 
+// handleContacts receives the set of chat JIDs the notch app wants to show.
+// It scopes history-sync import so unrelated chats are not stored.
+func (a *App) handleContacts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		JIDs []string `json:"jids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	set := make(map[string]bool, len(body.JIDs))
+	for _, jid := range body.JIDs {
+		if jid != "" {
+			set[jid] = true
+		}
+	}
+	a.mu.Lock()
+	a.contacts = set
+	a.mu.Unlock()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// handleAvatar serves a contact's WhatsApp profile picture, cached on disk for
+// a day. Missing pictures return 404 so the app falls back to a glyph.
+func (a *App) handleAvatar(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("jid")
+	jid, err := types.ParseJID(raw)
+	if err != nil {
+		http.Error(w, "invalid jid", http.StatusBadRequest)
+		return
+	}
+	cached := filepath.Join(a.avatarDir, strings.NewReplacer("/", "_", ":", "_", ".", "_").Replace(raw)+".jpg")
+	if fi, err := os.Stat(cached); err == nil && time.Since(fi.ModTime()) < 24*time.Hour {
+		w.Header().Set("Content-Type", "image/jpeg")
+		http.ServeFile(w, r, cached)
+		return
+	}
+	if a.client == nil {
+		http.Error(w, "not connected", http.StatusServiceUnavailable)
+		return
+	}
+	info, err := a.client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{Preview: true})
+	if err != nil || info == nil || info.URL == "" {
+		http.Error(w, "no avatar", http.StatusNotFound)
+		return
+	}
+	resp, err := http.Get(info.URL)
+	if err != nil {
+		http.Error(w, "fetch failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil || len(data) == 0 {
+		http.Error(w, "fetch failed", http.StatusBadGateway)
+		return
+	}
+	if err := os.WriteFile(cached, data, 0o600); err != nil {
+		log.Printf("avatar cache write failed: %v", err)
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Write(data)
+}
+
 func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
 	if a.client != nil {
-		_ = a.client.Logout(context.Background())
+		if a.client.Store.ID != nil {
+			if err := a.client.Logout(ctx); err != nil {
+				log.Printf("logout failed, deleting device: %v", err)
+				_ = a.client.Store.Delete(ctx)
+			}
+		} else {
+			// Stuck in a half-paired state: drop the device outright.
+			_ = a.client.Store.Delete(ctx)
+		}
+		a.client.Disconnect()
+		a.client = nil
 	}
 	a.mu.Lock()
 	a.messages = nil
+	a.lastQR = ""
 	a.mu.Unlock()
 	a.saveMessages()
+	a.broadcast("loggedout", nil)
+
+	// Re-arm a fresh QR login so the user can link again immediately.
+	if err := a.connectClient(ctx); err != nil {
+		log.Printf("re-login init failed: %v", err)
+	}
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
