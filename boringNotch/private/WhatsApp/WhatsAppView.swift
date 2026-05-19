@@ -62,8 +62,13 @@ struct WhatsAppView: View {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             if event.keyCode == 53 { // Esc
-                inputFocused = false
-                vm.close()
+                // Cancel a pending image first; otherwise collapse the notch.
+                if pendingImage != nil {
+                    pendingImage = nil
+                } else {
+                    inputFocused = false
+                    vm.close()
+                }
                 return nil
             }
             // Cmd+V: stage a pasteboard image for confirmation. Text paste
