@@ -40,8 +40,9 @@ class BoringNotchWindow: NSPanel {
         hasShadow = false
     }
     
+    // Must become key so text fields inside the notch accept keyboard input.
     override var canBecomeKey: Bool {
-        false
+        true
     }
     
     override var canBecomeMain: Bool {

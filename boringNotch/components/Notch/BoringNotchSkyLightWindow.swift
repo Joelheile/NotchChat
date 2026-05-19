@@ -109,6 +109,9 @@ class BoringNotchSkyLightWindow: NSPanel {
     
     private var observers: Set<AnyCancellable> = []
     
-    override var canBecomeKey: Bool { false }
+    // Must become key so text fields inside the notch (WhatsApp chat) accept
+    // keyboard input. The .nonactivatingPanel style keeps the app from
+    // stealing focus when this happens.
+    override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 }
