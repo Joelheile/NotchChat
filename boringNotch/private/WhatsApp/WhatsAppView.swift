@@ -1,11 +1,15 @@
 import CoreImage.CIFilterBuiltins
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Right-column notch panel: a minimal WhatsApp chat with the configured
 /// cofounder. Handles QR login, the message list, and sending text.
 struct WhatsAppView: View {
+    @EnvironmentObject private var vm: BoringViewModel
     @ObservedObject private var manager = WhatsAppManager.shared
     @State private var draft = ""
+    @State private var escMonitor: Any?
+    @FocusState private var inputFocused: Bool
 
     var body: some View {
         VStack(spacing: 6) {
@@ -30,79 +34,213 @@ struct WhatsAppView: View {
         .onAppear {
             manager.start()
             manager.markRead()
+            // Focus the field on open so the user can type without clicking it.
+            DispatchQueue.main.async { inputFocused = true }
+            installEscMonitor()
         }
-        .onDisappear { WAAudioPlayer.shared.stop() }
+        .onDisappear {
+            WAAudioPlayer.shared.stop()
+            SharingStateManager.shared.preventNotchClose = false
+            if let escMonitor { NSEvent.removeMonitor(escMonitor) }
+            escMonitor = nil
+        }
+        // Keep the notch open only while there is unsent text in the field,
+        // even when the cursor moves away. An empty field never blocks closing.
+        .onChange(of: draft) { _, text in
+            SharingStateManager.shared.preventNotchClose =
+                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// Esc collapses the notch. A local key monitor is used instead of
+    /// onKeyPress so it fires reliably even while the text field is focused.
+    private func installEscMonitor() {
+        guard escMonitor == nil else { return }
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.keyCode == 53 else { return event } // Esc
+            inputFocused = false
+            vm.close()
+            return nil
+        }
     }
 
     // MARK: Chat
 
     private var chat: some View {
         VStack(spacing: 4) {
-            HStack(spacing: 5) {
-                Image(systemName: "bubble.left.fill")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.green)
-                Text(manager.contactName)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                Spacer()
-            }
-
             messageList
+                .onPasteCommand(of: [.image]) { _ in pasteImage() }
 
             HStack(spacing: 5) {
-                TextField("Message", text: $draft)
+                contactMenu
+
+                TextField("Message", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.caption)
+                    .lineLimit(1...5)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.1), in: Capsule())
-                    .onSubmit(sendDraft)
+                    .background(
+                        Color.white.opacity(0.1),
+                        in: RoundedRectangle(cornerRadius: 12)
+                    )
+                    .focused($inputFocused)
+                    // Enter sends; Shift+Enter inserts a newline.
+                    .onKeyPress(keys: [.return]) { press in
+                        if press.modifiers.contains(.shift) { return .ignored }
+                        sendDraft()
+                        return .handled
+                    }
 
-                Button(action: sendDraft) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 18))
-                        .foregroundStyle(draft.isEmpty ? .gray : .green)
+                Button(action: pickImage) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.gray)
                 }
                 .buttonStyle(.plain)
-                .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
     }
 
+    // MARK: Contact selector
+
+    /// The contact's avatar in the input row. Doubles as a chat picker menu
+    /// when more than one contact is configured.
+    @ViewBuilder private var contactMenu: some View {
+        let current = manager.contacts.first { $0.jid == manager.selectedJID }
+        if manager.contacts.count > 1 {
+            Menu {
+                ForEach(manager.contacts) { contact in
+                    Button {
+                        manager.select(contact.jid)
+                        manager.markRead()
+                    } label: {
+                        if contact.jid == manager.selectedJID {
+                            Label(contact.name, systemImage: "checkmark")
+                        } else if manager.unreadByChat[contact.jid] == true {
+                            Label(contact.name, systemImage: "circle.fill")
+                        } else {
+                            Text(contact.name)
+                        }
+                    }
+                }
+            } label: {
+                contactAvatar(current)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        } else if let current {
+            contactAvatar(current)
+        }
+    }
+
+    private func contactAvatar(_ contact: WAContact?) -> some View {
+        AsyncImage(url: contact.flatMap { WhatsAppManager.shared.avatarURL(for: $0.jid) }) { phase in
+            if case .success(let image) = phase {
+                image.resizable().scaledToFill()
+            } else {
+                ZStack {
+                    Color.gray.opacity(0.35)
+                    Image(systemName: "person.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white)
+                }
+            }
+        }
+        .frame(width: 22, height: 22)
+        .clipShape(Circle())
+    }
+
+    // Cap rendered rows: a non-lazy VStack of the full history made the
+    // open/close resize animation lag. The newest window is enough for a
+    // glance; scroll up still works within it.
+    private var displayedMessages: [WAMessage] {
+        Array(manager.messages.suffix(80))
+    }
+
+    /// Inverted list: the scroll view and every row are flipped vertically and
+    /// the messages iterate newest-first. The content's natural start is then
+    /// the newest message, so the panel always opens pinned to the bottom with
+    /// no scroll-position juggling. Scrolling up reveals older messages.
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 4) {
-                    if manager.messages.isEmpty {
+                    if displayedMessages.isEmpty {
                         Text("No messages yet")
                             .font(.caption2)
                             .foregroundStyle(.gray)
                             .padding(.top, 16)
+                            .scaleEffect(x: 1, y: -1, anchor: .center)
                     }
-                    ForEach(manager.messages) { message in
-                        WAMessageRow(message: message).id(message.id)
+                    ForEach(displayedMessages.reversed()) { message in
+                        WAMessageRow(message: message)
+                            .scaleEffect(x: 1, y: -1, anchor: .center)
+                            .id(message.id)
                     }
                 }
                 .padding(.vertical, 2)
             }
+            .scaleEffect(x: 1, y: -1, anchor: .center)
+            // After sending, jump back to the newest message even if the user
+            // had scrolled up. Incoming messages keep their position.
             .onChange(of: manager.messages.count) {
-                if let last = manager.messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
-            }
-            .onAppear {
-                if let last = manager.messages.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+                guard manager.messages.last?.fromMe == true,
+                      let newest = displayedMessages.last else { return }
+                withAnimation { proxy.scrollTo(newest.id, anchor: .center) }
             }
         }
     }
 
     private func sendDraft() {
-        let text = draft
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
         draft = ""
-        manager.send(text)
+        Task {
+            // Restore the draft if the sidecar could not send it.
+            let sent = await manager.send(text)
+            if !sent { draft = text }
+        }
+    }
+
+    /// Opens a file picker and sends the chosen image, using the current draft
+    /// text as its caption.
+    private func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let data = try? Data(contentsOf: url)
+        else { return }
+
+        let contentType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "image/jpeg"
+        manager.sendImage(
+            data: data,
+            filename: url.lastPathComponent,
+            contentType: contentType,
+            caption: draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        draft = ""
+    }
+
+    /// Sends an image from the pasteboard (Cmd+V), using the draft as caption.
+    private func pasteImage() {
+        guard let image = NSImage(pasteboard: .general),
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:])
+        else { return }
+
+        manager.sendImage(
+            data: png,
+            filename: "pasted.png",
+            contentType: "image/png",
+            caption: draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        draft = ""
     }
 
     // MARK: QR login
@@ -172,20 +310,67 @@ private struct WAMessageRow: View {
 
     @ViewBuilder
     private var bubble: some View {
-        Group {
-            if message.isAudio {
-                audioBubble
-            } else {
-                Text(message.text.isEmpty ? imagePlaceholder : message.text)
+        if message.hasImage {
+            imageBubble
+        } else {
+            Group {
+                if message.isAudio {
+                    audioBubble
+                } else {
+                    Text(message.text.isEmpty ? imagePlaceholder : message.text)
+                        .font(.caption)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                message.fromMe ? Color.green.opacity(0.45) : Color.white.opacity(0.12),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+        }
+    }
+
+    private var imageBubble: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            AsyncImage(url: WhatsAppManager.shared.mediaURL(for: message)) { phase in
+                switch phase {
+                case .success(let image):
+                    // scaledToFit shows the whole image; scaledToFill would
+                    // centre-crop and can hide most of a tall screenshot.
+                    image.resizable().scaledToFit()
+                case .failure:
+                    imageTile(icon: "exclamationmark.triangle")
+                default:
+                    imageTile(icon: "photo")
+                }
+            }
+            // Fixed thumbnail box: keeps row height deterministic so the list
+            // can anchor to the bottom before images finish loading.
+            .frame(width: 190, height: 150)
+            .background(Color.black.opacity(0.25))
+            .clipped()
+            .contentShape(Rectangle())
+            .onTapGesture { WAImagePreview.shared.show(message: message) }
+
+            if !message.text.isEmpty {
+                Text(message.text)
                     .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            message.fromMe ? Color.green.opacity(0.45) : Color.white.opacity(0.12),
-            in: RoundedRectangle(cornerRadius: 10)
-        )
+        .frame(width: 190)
+        .background(message.fromMe ? Color.green.opacity(0.45) : Color.white.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func imageTile(icon: String) -> some View {
+        ZStack {
+            Color.white.opacity(0.08)
+            Image(systemName: icon)
+                .font(.system(size: 20))
+                .foregroundStyle(.gray)
+        }
     }
 
     private var imagePlaceholder: String {

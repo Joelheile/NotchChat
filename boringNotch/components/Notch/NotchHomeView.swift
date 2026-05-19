@@ -446,6 +446,9 @@ struct NotchHomeView: View {
             if Defaults[.showWhatsApp] {
                 WhatsAppView()
                     .frame(width: shouldShowCamera ? 170 : 215)
+                    .onHover { isHovering in
+                        vm.isHoveringWhatsApp = isHovering
+                    }
                     .environmentObject(vm)
                     .transition(.opacity)
             } else if Defaults[.showCalendar] {
