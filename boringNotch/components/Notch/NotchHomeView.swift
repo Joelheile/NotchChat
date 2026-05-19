@@ -443,7 +443,12 @@ struct NotchHomeView: View {
         HStack(alignment: .top, spacing: (shouldShowCamera && Defaults[.showCalendar]) ? 10 : 15) {
             MusicPlayerView(albumArtNamespace: albumArtNamespace)
 
-            if Defaults[.showCalendar] {
+            if Defaults[.showWhatsApp] {
+                WhatsAppView()
+                    .frame(width: shouldShowCamera ? 170 : 215)
+                    .environmentObject(vm)
+                    .transition(.opacity)
+            } else if Defaults[.showCalendar] {
                 CalendarView()
                     .frame(width: shouldShowCamera ? 170 : 215)
                     .onHover { isHovering in

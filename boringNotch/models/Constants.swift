@@ -107,6 +107,10 @@ extension Defaults.Keys {
     static let showNotHumanFace = Key<Bool>("showNotHumanFace", default: false)
     static let tileShowLabels = Key<Bool>("tileShowLabels", default: false)
     static let showCalendar = Key<Bool>("showCalendar", default: false)
+    static let showWhatsApp = Key<Bool>("showWhatsApp", default: false)
+    static let whatsAppContactJID = Key<String>("whatsAppContactJID", default: "")
+    static let whatsAppContactName = Key<String>("whatsAppContactName", default: "Cofounder")
+    static let whatsAppSidecarPort = Key<Int>("whatsAppSidecarPort", default: 8765)
     static let hideCompletedReminders = Key<Bool>("hideCompletedReminders", default: true)
     static let sliderColor = Key<SliderColorEnum>(
         "sliderUseAlbumArtColor",
