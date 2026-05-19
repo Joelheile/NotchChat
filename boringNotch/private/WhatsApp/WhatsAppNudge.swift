@@ -12,7 +12,7 @@ struct WhatsAppNudge: View {
                 Image(systemName: "bubble.left.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(.green)
-                Text(manager.contactName)
+                Text(manager.name(for: manager.latestPreview?.chatJID ?? ""))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
@@ -23,12 +23,28 @@ struct WhatsAppNudge: View {
                 .fill(.black)
                 .frame(width: vm.closedNotchSize.width + 10)
 
-            Text(previewText)
-                .font(.system(size: 11))
-                .foregroundStyle(.gray)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(width: 110, alignment: .trailing)
+            Group {
+                if let message = manager.latestPreview, message.hasImage {
+                    AsyncImage(url: WhatsAppManager.shared.mediaURL(for: message)) { phase in
+                        if case .success(let image) = phase {
+                            image.resizable().scaledToFill()
+                        } else {
+                            Image(systemName: "photo")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.gray)
+                        }
+                    }
+                    .frame(width: 22, height: 22)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                } else {
+                    Text(previewText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.gray)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(width: 110, alignment: .trailing)
         }
         .frame(height: vm.effectiveClosedNotchHeight, alignment: .center)
     }

@@ -108,6 +108,9 @@ extension Defaults.Keys {
     static let tileShowLabels = Key<Bool>("tileShowLabels", default: false)
     static let showCalendar = Key<Bool>("showCalendar", default: false)
     static let showWhatsApp = Key<Bool>("showWhatsApp", default: false)
+    static let whatsAppContacts = Key<[WAContact]>("whatsAppContacts", default: [])
+    static let whatsAppLastContact = Key<String>("whatsAppLastContact", default: "")
+    // Legacy single-contact keys, migrated into whatsAppContacts on first launch.
     static let whatsAppContactJID = Key<String>("whatsAppContactJID", default: "")
     static let whatsAppContactName = Key<String>("whatsAppContactName", default: "Cofounder")
     static let whatsAppSidecarPort = Key<Int>("whatsAppSidecarPort", default: 8765)

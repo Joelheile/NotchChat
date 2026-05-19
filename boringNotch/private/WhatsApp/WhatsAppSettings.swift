@@ -5,8 +5,7 @@ import SwiftUI
 struct WhatsAppSettings: View {
     @ObservedObject private var manager = WhatsAppManager.shared
     @Default(.showWhatsApp) private var showWhatsApp
-    @Default(.whatsAppContactName) private var contactName
-    @Default(.whatsAppContactJID) private var contactNumber
+    @Default(.whatsAppContacts) private var contacts
 
     var body: some View {
         Form {
@@ -19,10 +18,22 @@ struct WhatsAppSettings: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section(header: Text("Cofounder")) {
-                TextField("Name", text: $contactName)
-                TextField("Phone number (with country code)", text: $contactNumber)
-                Text("Digits only, e.g. 491701234567. Used to match the chat.")
+            Section(header: Text("Contacts")) {
+                ForEach($contacts) { $contact in
+                    VStack(alignment: .leading, spacing: 4) {
+                        TextField("Name", text: $contact.name)
+                        TextField("Phone number (with country code)", text: $contact.number)
+                    }
+                }
+                .onDelete { contacts.remove(atOffsets: $0) }
+
+                Button {
+                    contacts.append(WAContact(name: "", number: ""))
+                } label: {
+                    Label("Add contact", systemImage: "plus")
+                }
+
+                Text("Digits only, e.g. 491701234567. Each contact gets a tab in the notch.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -53,6 +64,9 @@ struct WhatsAppSettings: View {
         }
         .onChange(of: showWhatsApp) { _, enabled in
             if enabled { manager.start() }
+        }
+        .onChange(of: contacts) { _, _ in
+            manager.reloadContacts()
         }
     }
 
