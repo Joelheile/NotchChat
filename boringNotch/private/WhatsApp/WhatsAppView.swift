@@ -8,7 +8,8 @@ struct WhatsAppView: View {
     @EnvironmentObject private var vm: BoringViewModel
     @ObservedObject private var manager = WhatsAppManager.shared
     @State private var draft = ""
-    @State private var escMonitor: Any?
+    @State private var pendingImage: NSImage?
+    @State private var keyMonitor: Any?
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -36,31 +37,43 @@ struct WhatsAppView: View {
             manager.markRead()
             // Focus the field on open so the user can type without clicking it.
             DispatchQueue.main.async { inputFocused = true }
-            installEscMonitor()
+            installKeyMonitor()
         }
         .onDisappear {
             WAAudioPlayer.shared.stop()
             SharingStateManager.shared.preventNotchClose = false
-            if let escMonitor { NSEvent.removeMonitor(escMonitor) }
-            escMonitor = nil
+            if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+            keyMonitor = nil
         }
-        // Keep the notch open only while there is unsent text in the field,
-        // even when the cursor moves away. An empty field never blocks closing.
-        .onChange(of: draft) { _, text in
-            SharingStateManager.shared.preventNotchClose =
-                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
+        // Keep the notch open while there is unsent text or a pending image.
+        .onChange(of: draft) { _, _ in updateNotchHold() }
+        .onChange(of: pendingImage != nil) { _, _ in updateNotchHold() }
     }
 
-    /// Esc collapses the notch. A local key monitor is used instead of
-    /// onKeyPress so it fires reliably even while the text field is focused.
-    private func installEscMonitor() {
-        guard escMonitor == nil else { return }
-        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.keyCode == 53 else { return event } // Esc
-            inputFocused = false
-            vm.close()
-            return nil
+    private func updateNotchHold() {
+        let hasText = !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        SharingStateManager.shared.preventNotchClose = hasText || pendingImage != nil
+    }
+
+    /// Local key monitor: handles Esc (collapse the notch) and Cmd+V of an
+    /// image. A monitor is used instead of onKeyPress/onPasteCommand so both
+    /// fire reliably even while the text field has focus.
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 { // Esc
+                inputFocused = false
+                vm.close()
+                return nil
+            }
+            // Cmd+V: stage a pasteboard image for confirmation. Text paste
+            // (no image on the pasteboard) falls through to the text field.
+            if event.keyCode == 9, event.modifierFlags.contains(.command),
+               let image = NSImage(pasteboard: .general) {
+                pendingImage = image
+                return nil
+            }
+            return event
         }
     }
 
@@ -69,7 +82,10 @@ struct WhatsAppView: View {
     private var chat: some View {
         VStack(spacing: 4) {
             messageList
-                .onPasteCommand(of: [.image]) { _ in pasteImage() }
+
+            if let pendingImage {
+                imageConfirmBar(pendingImage)
+            }
 
             HStack(spacing: 5) {
                 contactMenu
@@ -85,10 +101,11 @@ struct WhatsAppView: View {
                         in: RoundedRectangle(cornerRadius: 12)
                     )
                     .focused($inputFocused)
-                    // Enter sends; Shift+Enter inserts a newline.
+                    // Enter sends; Shift+Enter inserts a newline. With a
+                    // pending pasted image, Enter confirms and sends it.
                     .onKeyPress(keys: [.return]) { press in
                         if press.modifiers.contains(.shift) { return .ignored }
-                        sendDraft()
+                        if pendingImage != nil { sendPendingImage() } else { sendDraft() }
                         return .handled
                     }
 
@@ -100,6 +117,39 @@ struct WhatsAppView: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    /// Confirmation bar shown after a Cmd+V image paste, before it is sent.
+    private func imageConfirmBar(_ image: NSImage) -> some View {
+        HStack(spacing: 6) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 34, height: 34)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Text("Send image?")
+                .font(.caption)
+
+            Spacer(minLength: 0)
+
+            Button { pendingImage = nil } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.gray)
+            }
+            .buttonStyle(.plain)
+
+            Button(action: sendPendingImage) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.green)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: Contact selector
@@ -226,13 +276,13 @@ struct WhatsAppView: View {
         draft = ""
     }
 
-    /// Sends an image from the pasteboard (Cmd+V), using the draft as caption.
-    private func pasteImage() {
-        guard let image = NSImage(pasteboard: .general),
+    /// Sends the image staged by a Cmd+V paste, using the draft as caption.
+    private func sendPendingImage() {
+        guard let image = pendingImage,
               let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:])
-        else { return }
+        else { pendingImage = nil; return }
 
         manager.sendImage(
             data: png,
@@ -241,6 +291,7 @@ struct WhatsAppView: View {
             caption: draft.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         draft = ""
+        pendingImage = nil
     }
 
     // MARK: QR login
