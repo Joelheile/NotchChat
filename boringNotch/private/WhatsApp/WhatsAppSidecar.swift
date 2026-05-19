@@ -13,7 +13,7 @@ final class WhatsAppSidecar {
 
     /// Shared secret passed to the sidecar on launch and required on every
     /// request. Regenerated each app launch; never persisted.
-    let token: String = Self.makeToken()
+    let token: String = WhatsAppSidecar.makeToken()
 
     private init() {
         port = Defaults[.whatsAppSidecarPort]
