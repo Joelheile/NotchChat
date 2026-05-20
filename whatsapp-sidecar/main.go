@@ -363,6 +363,29 @@ func (a *App) applyContent(m *Message, wm *waE2E.Message, download bool) {
 	if wm == nil {
 		return
 	}
+	// Unwrap container messages (disappearing, view-once, device-sent, edited,
+	// document-with-caption, future-proof). Without this, the real content
+	// stays buried and the message is dropped as empty.
+	for i := 0; i < 4; i++ {
+		switch {
+		case wm.GetEphemeralMessage().GetMessage() != nil:
+			wm = wm.GetEphemeralMessage().GetMessage()
+		case wm.GetViewOnceMessage().GetMessage() != nil:
+			wm = wm.GetViewOnceMessage().GetMessage()
+		case wm.GetViewOnceMessageV2().GetMessage() != nil:
+			wm = wm.GetViewOnceMessageV2().GetMessage()
+		case wm.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			wm = wm.GetViewOnceMessageV2Extension().GetMessage()
+		case wm.GetDeviceSentMessage().GetMessage() != nil:
+			wm = wm.GetDeviceSentMessage().GetMessage()
+		case wm.GetEditedMessage().GetMessage() != nil:
+			wm = wm.GetEditedMessage().GetMessage()
+		case wm.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			wm = wm.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			i = 4
+		}
+	}
 	if c := wm.GetConversation(); c != "" {
 		m.Text = c
 	} else if ext := wm.GetExtendedTextMessage(); ext != nil {
