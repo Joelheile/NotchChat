@@ -109,16 +109,17 @@ struct ContentView: View {
                             .frame(height: 1)
                             .padding(.horizontal, topCornerRadius)
                     }
-                    .overlay {
+                    .overlay(alignment: .trailing) {
                         if whatsApp.hasUnread && vm.notchState == .closed {
-                            currentNotchShape
-                                .stroke(Color.green, lineWidth: 1.5)
-                                .blur(radius: 4)
-                                .opacity(0.9)
+                            Circle()
+                                .fill(Color(red: 0.145, green: 0.827, blue: 0.4))
+                                .frame(width: 6, height: 6)
+                                .padding(.trailing, 10)
+                                .transition(.opacity.combined(with: .scale))
                                 .allowsHitTesting(false)
                         }
                     }
-                    .animation(.easeInOut(duration: 0.4), value: whatsApp.hasUnread)
+                    .animation(.easeInOut(duration: 0.25), value: whatsApp.hasUnread)
                     .shadow(
                         color: ((vm.notchState == .open || isHovering) && Defaults[.enableShadow])
                             ? .black.opacity(0.7) : .clear, radius: Defaults[.cornerRadiusScaling] ? 6 : 4
@@ -295,10 +296,6 @@ struct ContentView: View {
                             .frame(width: 76, alignment: .trailing)
                         }
                         .frame(height: vm.effectiveClosedNotchHeight, alignment: .center)
-                      } else if Defaults[.showWhatsApp] && whatsApp.hasUnread && !coordinator.expandingView.show && vm.notchState == .closed && !vm.hideOnClosed {
-                          WhatsAppNudge()
-                              .environmentObject(vm)
-                              .transition(.opacity)
                       } else if coordinator.sneakPeek.show && Defaults[.inlineHUD] && (coordinator.sneakPeek.type != .music) && (coordinator.sneakPeek.type != .battery) && vm.notchState == .closed {
                           InlineHUD(type: $coordinator.sneakPeek.type, value: $coordinator.sneakPeek.value, icon: $coordinator.sneakPeek.icon, hoverAnimation: $isHovering, gestureProgress: $gestureProgress)
                               .transition(.opacity)
