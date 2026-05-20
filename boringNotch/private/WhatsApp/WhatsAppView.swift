@@ -36,7 +36,13 @@ struct WhatsAppView: View {
             manager.start()
             manager.markRead()
             // Focus the field on open so the user can type without clicking it.
-            DispatchQueue.main.async { inputFocused = true }
+            // When the notch opens via hover the panel never receives a mouse
+            // click, so SwiftUI's focus state is ignored until we promote the
+            // panel to key ourselves.
+            DispatchQueue.main.async {
+                promoteNotchWindowToKey()
+                inputFocused = true
+            }
             installKeyMonitor()
         }
         .onDisappear {
@@ -58,6 +64,17 @@ struct WhatsAppView: View {
     /// Local key monitor: handles Esc (collapse the notch) and Cmd+V of an
     /// image. A monitor is used instead of onKeyPress/onPasteCommand so both
     /// fire reliably even while the text field has focus.
+    /// Make the notch panel containing this view the key window so the
+    /// SwiftUI focus state actually takes effect. Hover-only opens never go
+    /// through a mouse click, which is what normally promotes the panel.
+    private func promoteNotchWindowToKey() {
+        let mouse = NSEvent.mouseLocation
+        let panels = NSApp.windows.compactMap { $0 as? BoringNotchSkyLightWindow }
+        let target = panels.first { $0.screen?.frame.contains(mouse) ?? false }
+            ?? panels.first
+        target?.makeKey()
+    }
+
     private func installKeyMonitor() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
