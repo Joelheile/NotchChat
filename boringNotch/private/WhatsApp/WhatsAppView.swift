@@ -396,20 +396,16 @@ private struct WAMessageRow: View {
             AsyncImage(url: WhatsAppManager.shared.mediaURL(for: message)) { phase in
                 switch phase {
                 case .success(let image):
-                    // scaledToFit shows the whole image; scaledToFill would
-                    // centre-crop and can hide most of a tall screenshot.
+                    // Natural aspect, no letterbox: the image fills the width
+                    // and its height follows the source ratio.
                     image.resizable().scaledToFit()
                 case .failure:
-                    imageTile(icon: "exclamationmark.triangle")
+                    imageTile(icon: "exclamationmark.triangle").frame(height: 100)
                 default:
-                    imageTile(icon: "photo")
+                    imageTile(icon: "photo").frame(height: 100)
                 }
             }
-            // Fixed thumbnail box: keeps row height deterministic so the list
-            // can anchor to the bottom before images finish loading.
-            .frame(width: 190, height: 150)
-            .background(Color.black.opacity(0.25))
-            .clipped()
+            .frame(maxWidth: 190)
             .contentShape(Rectangle())
             .onTapGesture { WAImagePreview.shared.show(message: message) }
 
@@ -420,7 +416,7 @@ private struct WAMessageRow: View {
                     .padding(.vertical, 5)
             }
         }
-        .frame(width: 190)
+        .frame(maxWidth: 190)
         .background(message.fromMe ? Color.green.opacity(0.45) : Color.white.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
