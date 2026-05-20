@@ -1,0 +1,60 @@
+name: NotchChat Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: whatsapp-sidecar/go.sum
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build WhatsApp sidecar
+        working-directory: whatsapp-sidecar
+        run: bash build.sh
+
+      - name: Build app
+        run: |
+          xcodebuild \
+            -project boringNotch.xcodeproj \
+            -scheme boringNotch \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp -R build/Build/Products/Release/boringNotch.app dist/NotchChat.app
+          codesign --force --deep --sign - dist/NotchChat.app
+          cd dist
+          zip -r -y NotchChat.zip NotchChat.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NotchChat
+          path: dist/NotchChat.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/NotchChat.zip
+          generate_release_notes: true
